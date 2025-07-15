@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+
+import rospy
+import cv2
+import numpy as np
+from sensor_msgs.msg import CompressedImage, Image
+from duckietown_msgs.msg import WheelsCmdStamped
+from std_msgs.msg import Float32, Bool, Header
+from cv_bridge import CvBridge
+import math
+import time
+
+class EarlyTurnDetectionNode:
+    def init(self):
+        rospy.init_node('early_turn_detection_node', anonymous=True)
+        
+        self.bridge = CvBridge()
+        
+        # Publishers
+        self.cmd_vel_pub = rospy.Publisher('/duckduck/wheels_driver_node/wheels_cmd', WheelsCmdStamped, queue_size=1)
+        self.debug_image_pub = rospy.Publisher('/lane_detection/debug_image', Image, queue_size=1)
+        self.debug_compressed_pub = rospy.Publisher('/lane_detection/debug_image/compressed', CompressedImage, queue_size=1)
+        self.steering_angle_pub = rospy.Publisher('/lane_detection/steering_angle', Float32, queue_size=1)
+        self.lane_detected_pub = rospy.Publisher('/lane_detection/lane_detected', Bool, queue_size=1)
+        
+        # Subscriber
+        self.image_sub = rospy.Subscriber('/duckduck/camera_node/image/compressed', CompressedImage, 
+                                        self.image_callback, queue_size=1, buff_size=2**16)
+        
+        # Speed parameters (SAMA - 0.1 m/s)
+        self.base_linear_speed = 0.1
+        self.turn_linear_speed = 0.08
+        self.sharp_turn_speed = 0.06
+        
+        # ENHANCED: Earlier turn detection parameters
+        self.angular_speed_gain = 4.0       # Increased untuk earlier response
+        self.max_angular_speed = 5.0        # Higher untuk sharp early turns
+        
+        # CRITICAL: Early turn detection thresholds
+        self.early_turn_threshold = 0.35    # Lower threshold untuk earlier detection
+        self.line_disappear_threshold = 3   # Start turning setelah 3 frames hilang
+        self.predictive_steering_gain = 2.0 # Extra gain untuk predictive steering
+        
+        # ENHANCED: Expanded ROI untuk earlier detection
+        self.roi_top_ratio = 0.40           # Start ROI lebih tinggi (25% dari atas)
+        self.roi_bottom_ratio = 0.9         # Sama
+        self.roi_left_ratio = 0.05          # Expand ke kiri
+        self.roi_right_ratio = 0.95         # Expand ke kanan
+        
+        # CRITICAL: Track state management
+        self.left_line_missing_count = 0
+        self.right_line_missing_count = 0
+        self.turn_prediction_mode = False
+        self.predicted_turn_direction = 0   # -1 left, 1 right, 0 none
+        self.last_valid_steering = 0.0
+        
+        # White line detection (SAMA seperti sebelumnya)
+        self.lower_white_hsv = np.array([5, 60, 60])
+        self.upper_white_hsv = np.array([25, 255, 255])
+        self.white_threshold_gray = 210
+        
+        # Hough parameters (SAMA)
+        self.hough_threshold = 5
+        self.min_line_length = 20
+        self.max_line_gap = 20
+        
+        # Control variables
+        self.last_steering_angle = 0.0
+        self.steering_smoothing = 0.1       # Reduced untuk faster response
+        self.no_line_counter = 0
+        self.max_no_line_frames = 12        # Increased tolerance
+        
+        # Performance tracking
+        self.frame_count = 0
+        self.detection_count = 0
+        self.last_log_time = time.time()
+        
+        rospy.loginfo("Early Turn Detection Node Initialized")
+        rospy.loginfo("ENHANCED for EARLY 90-degree turn detection")
+        rospy.loginfo(f"Early turn threshold: {self.early_turn_threshold}")
+        rospy.loginfo(f"Expanded ROI: top={self.roi_top_ratio}, left={self.roi_left_ratio}, right={self.roi_right_ratio}")
+        
+    def image_callback(self, msg):
+        try:
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            
+            if cv_image is None:
+                return
+                
+            self.process_early_turn_detection(cv_image)
+            
+        except Exception as e:
+            rospy.logerr(f"Image processing error: {e}")
+    
+    def process_early_turn_detection(self, image):
+        self.frame_count += 1
+        
+        height, width = image.shape[:2]
+        
+        # EXPANDED ROI untuk earlier detection
+        roi_top = int(height * self.roi_top_ratio)      # Start higher
+        roi_bottom = int(height * self.roi_bottom_ratio)
+        roi_left = int(width * self.roi_left_ratio)     # Wider left
+        roi_right = int(width * self.roi_right_ratio)   # Wider right
+        
+        roi = image[roi_top:roi_bottom, roi_left:roi_right]
+        
+        # White line detection (SAMA seperti sebelumnya)
+        white_lines, combined_mask = self.detect_white_lines_improved(roi)
+        
+        # CRITICAL: Early turn prediction analysis
+        steering_angle, lane_detected, turn_prediction = self.analyze_early_turn_scenario(
+            white_lines, roi.shape[1], roi_left, width)
+        
+        # ENHANCED: Apply predictive steering
+        steering_angle = self.apply_predictive_steering(steering_angle, lane_detected, turn_prediction)
+        
+        # Apply minimal smoothing untuk quick response
+        steering_angle = self.apply_quick_response_smoothing(steering_angle, lane_detected)
+        
+        # Publish enhanced commands
+        self.publish_early_turn_commands(steering_angle, lane_detected, turn_prediction)
+        
+        # Create debug visualization
+        debug_image = self.create_early_turn_debug_image(
+            image, roi, white_lines, combined_mask, 
+            roi_top, roi_left, roi_right, roi_bottom,
+            steering_angle, lane_detected, turn_prediction)
+        
+        # Publish debug image
+        self.publish_debug_image(debug_image)
+        
+        # Enhanced logging
+        if time.time() - self.last_log_time > 2.0:
+            detection_rate = (self.detection_count / self.frame_count) * 100 if self.frame_count > 0 else 0
+            turn_status = f"PREDICT_{turn_prediction}" if self.turn_prediction_mode else "NORMAL"
+            rospy.loginfo(f"Frame {self.frame_count} | Rate: {detection_rate:.1f}% | "
+                         f"Lines: {len(white_lines)} | Steering: {steering_angle:.3f} | Mode: {turn_status}")
+            self.last_log_time = time.time()
+    
+    def detect_white_lines_improved(self, roi_image):
+        """White line detection - SAMA seperti sebelumnya"""
+        
+        if roi_image.size == 0:
+            return [], np.zeros((10, 10), dtype=np.uint8)
+        
+        height, width = roi_image.shape[:2]
+        
+        # Grayscale threshold
+        gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
+        mask_gray = cv2.threshold(gray, self.white_threshold_gray, 255, cv2.THRESH_BINARY)[1]
+        
+        # HSV white detection
+        hsv = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)
+        mask_hsv = cv2.inRange(hsv, self.lower_white_hsv, self.upper_white_hsv)
+        
+        # LAB color space
+        lab = cv2.cvtColor(roi_image, cv2.COLOR_BGR2LAB)
+        mask_lab = cv2.threshold(lab[:,:,0], 180, 255, cv2.THRESH_BINARY)[1]
+        
+        # Combine methods
+        combined_mask = cv2.bitwise_or(mask_gray, mask_hsv)
+        combined_mask = cv2.bitwise_or(combined_mask, mask_lab)
+        
+        # Morphological operations
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_small)
+        
+        kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_medium)
+        
+        # Edge detection
+        edges = cv2.Canny(combined_mask, 50, 150, apertureSize=3)
+        
+        # Hough line detection
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi/180,
+            threshold=self.hough_threshold,
+            minLineLength=self.min_line_length,
+            maxLineGap=self.max_line_gap
+        )
+        
+        # Filter valid lines
+        valid_lines = []
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                if self.is_valid_white_line(x1, y1, x2, y2, width, height):
+                    valid_lines.append([x1, y1, x2, y2])
+        
+        return valid_lines, combined_mask
+    
+    def is_valid_white_line(self, x1, y1, x2, y2, width, height):
+        """Line validation - SAMA seperti sebelumnya"""
+        length = np.sqrt((x2-x1)*2 + (y2-y1)*2)
+        
+        if length < 15:
+            return False
+        
+        if min(x1, x2) < 0 or max(x1, x2) >= width:
+            return False
+        if min(y1, y2) < 0 or max(y1, y2) >= height:
+            return False
+        
+        if x2 != x1:
+            angle = abs(math.atan2(y2-y1, x2-x1) * 180.0 / np.pi)
+            if angle < 8 or angle > 172:
+                return False
+        
+        if x2 != x1:
+            slope = abs((y2-y1)/(x2-x1))
+            if slope > 3:
+                return False
+        
+        return True
+    
+    def analyze_early_turn_scenario(self, lines, roi_width, roi_left_offset, full_image_width):
+        """CRITICAL: Analyze untuk early turn detection"""
+        
+        if len(lines) == 0:
+            return 0.0, False, "NO_LINES"
+        
+        self.detection_count += 1
+        
+        # Convert to full image coordinates
+        full_image_lines = []
+        for line in lines:
+            x1, y1, x2, y2 = line
+            full_image_lines.append([x1 + roi_left_offset, y1, x2 + roi_left_offset, y2])
+        
+        full_image_center = full_image_width // 2
+        
+        # Separate left and right lines
+        left_lines = []
+        right_lines = []
+        
+        for line in full_image_lines:
+            x1, y1, x2, y2 = line
+            line_center_x = (x1 + x2) / 2
+            
+            if line_center_x < full_image_center:
+                left_lines.append(line)
+            else:
+                right_lines.append(line)
+        
+        # CRITICAL: Track missing lines untuk early turn prediction
+        if len(left_lines) == 0:
+            self.left_line_missing_count += 1
+        else:
+            self.left_line_missing_count = 0
+            
+        if len(right_lines) == 0:
+            self.right_line_missing_count += 1
+        else:
+            self.right_line_missing_count = 0
+        
+        # EARLY TURN PREDICTION LOGIC
+        turn_prediction = "NORMAL"
+        steering_angle = 0.0
+        
+        # Scenario 1: Both sides present - normal calculation dengan early turn detection
+        if len(left_lines) > 0 and len(right_lines) > 0:
+            left_avg_x = np.mean([[x1, x2] for x1, y1, x2, y2 in left_lines])
+            right_avg_x = np.mean([[x1, x2] for x1, y1, x2, y2 in right_lines])
+            lane_center_x = (left_avg_x + right_avg_x) / 2
+            
+            deviation = lane_center_x - full_image_center
+            steering_angle = deviation / (full_image_center * 0.5)  # More responsive
+            
+            # Check for early turn indicators
+            lane_width = right_avg_x - left_avg_x
+            if lane_width < 150:  # Lane narrowing indicates upcoming turn
+                turn_prediction = "NARROWING"
+            elif abs(deviation) > full_image_center * 0.4:  # Lane shifting
+                turn_prediction = "SHIFTING"
+        
+        # Scenario 2: Left line missing - EARLY RIGHT TURN PREDICTION
+        elif len(left_lines) == 0 and len(right_lines) > 0:
+            right_avg_x = np.mean([[x1, x2] for x1, y1, x2, y2 in right_lines])
+            
+            if self.left_line_missing_count >= self.line_disappear_threshold:
+                # EARLY RIGHT TURN DETECTED
+                turn_prediction = "RIGHT_TURN"
+                self.turn_prediction_mode = True
+                self.predicted_turn_direction = 1
+                
+                # AGGRESSIVE RIGHT STEERING
+                if right_avg_x > full_image_center * 1.1:
+                    steering_angle = 0.8  # Strong right turn
+                else:
+                    steering_angle = 0.6  # Moderate right turn
+                    
+                rospy.loginfo(f"EARLY RIGHT TURN DETECTED! Missing left for {self.left_line_missing_count} frames")
+            else:
+                # Still in normal mode, follow right line
+                target_position = right_avg_x - 120
+                deviation = target_position - full_image_center
+                steering_angle = deviation / (full_image_center * 0.5)
+        
+        # Scenario 3: Right line missing - EARLY LEFT TURN PREDICTION  
+        elif len(right_lines) == 0 and len(left_lines) > 0:
+            left_avg_x = np.mean([[x1, x2] for x1, y1, x2, y2 in left_lines])
+            
+            if self.right_line_missing_count >= self.line_disappear_threshold:
+                # EARLY LEFT TURN DETECTED
+                turn_prediction = "LEFT_TURN"
+                self.turn_prediction_mode = True
+                self.predicted_turn_direction = -1
+                
+                # AGGRESSIVE LEFT STEERING
+                if left_avg_x < full_image_center * 0.9:
+                    steering_angle = -0.8  # Strong left turn
+                else:
+                    steering_angle = -0.6  # Moderate left turn
+                    
+                rospy.loginfo(f"EARLY LEFT TURN DETECTED! Missing right for {self.right_line_missing_count} frames")
+            else:
+                # Still in normal mode, follow left line
+                target_position = left_avg_x + 120
+                deviation = target_position - full_image_center
+                steering_angle = deviation / (full_image_center * 0.5)
+        
+        # Scenario 4: No lines - continue predicted turn
+        else:
+            if self.turn_prediction_mode and abs(self.last_valid_steering) > 0.3:
+                steering_angle = self.last_valid_steering * 1.2  # Amplify last steering
+                turn_prediction = f"CONTINUE_{self.predicted_turn_direction}"
+            else:
+                steering_angle = 0.0
+                turn_prediction = "NO_LINES"
+        
+        # Store last valid steering for prediction
+        if abs(steering_angle) > 0.1:
+            self.last_valid_steering = steering_angle
+        
+        # Reset prediction mode when both lines return
+        if len(left_lines) > 0 and len(right_lines) > 0:
+            self.turn_prediction_mode = False
+            self.predicted_turn_direction = 0
+        
+        # Clamp steering
+        steering_angle = max(-1.0, min(1.0, steering_angle))
+        
+        return steering_angle, True, turn_prediction
+    
+    def apply_predictive_steering(self, steering_angle, lane_detected, turn_prediction):
+        """Apply predictive steering boost untuk early turns"""
+        
+        if turn_prediction in ["RIGHT_TURN", "LEFT_TURN"]:
+            # Apply predictive boost
+            steering_angle *= self.predictive_steering_gain
+            steering_angle = max(-1.0, min(1.0, steering_angle))
+            
+        elif turn_prediction.startswith("CONTINUE_"):
+            # Continue turn dengan slight boost
+            steering_angle *= 1.3
+            steering_angle = max(-1.0, min(1.0, steering_angle))
+        
+        return steering_angle
+    
+    def apply_quick_response_smoothing(self, steering_angle, lane_detected):
+        """Minimal smoothing untuk quick response"""
+        
+        if not lane_detected:
+            self.no_line_counter += 1
+            if self.no_line_counter < self.max_no_line_frames:
+                # Use prediction mode if active
+                if self.turn_prediction_mode:
+                    steering_angle = self.last_valid_steering * 0.95
+                    lane_detected = True
+                else:
+                    decay_factor = 0.9 ** self.no_line_counter
+                    steering_angle = self.last_steering_angle * decay_factor
+                    lane_detected = True
+            else:
+                steering_angle = 0.0
+        else:
+            self.no_line_counter = 0
+            
+            # MINIMAL smoothing untuk quick response
+            if self.turn_prediction_mode:
+                # No smoothing during predicted turns
+                smoothing = 0.0
+            else:
+                # Minimal smoothing for normal driving
+                smoothing = self.steering_smoothing
+            
+            steering_angle = (smoothing * self.last_steering_angle + 
+                            (1 - smoothing) * steering_angle)
+        
+        self.last_steering_angle = steering_angle
+        return steering_angle
+    
+    def publish_early_turn_commands(self, steering_angle, lane_detected, turn_prediction):
+        """Publish commands dengan early turn consideration"""
+        
+        wheels_cmd = WheelsCmdStamped()
+        wheels_cmd.header.stamp = rospy.Time.now()
+        wheels_cmd.header.frame_id = "base_link"
+        
+        if lane_detected:
+            abs_steering = abs(steering_angle)
+            
+            # Speed control berdasarkan turn prediction
+            if turn_prediction in ["RIGHT_TURN", "LEFT_TURN"]:
+                # Slowest speed untuk predicted turns
+                linear_vel = self.sharp_turn_speed * 0.8  # Even slower
+            elif abs_steering > 0.6:
+                # Sharp steering
+                linear_vel = self.sharp_turn_speed
+            elif abs_steering > 0.3:
+                # Moderate steering
+                linear_vel = self.turn_linear_speed
+            else:
+                # Straight driving
+                linear_vel = self.base_linear_speed
+            
+            # Angular velocity dengan early turn boost
+            angular_vel = -steering_angle * self.angular_speed_gain
+            
+            if turn_prediction in ["RIGHT_TURN", "LEFT_TURN"]:
+                # Extra boost untuk early turns
+                angular_vel *= 1.5
+            
+            angular_vel = max(-self.max_angular_speed, min(self.max_angular_speed, angular_vel))
+            
+            # Differential drive
+            wheel_base = 0.1
+            vel_left = linear_vel - (angular_vel * wheel_base / 2.0)
+            vel_right = linear_vel + (angular_vel * wheel_base / 2.0)
+            
+            wheels_cmd.vel_left = vel_left
+            wheels_cmd.vel_right = vel_right
+        else:
+            wheels_cmd.vel_left = 0.0
+            wheels_cmd.vel_right = 0.0
+        
+        self.cmd_vel_pub.publish(wheels_cmd)
+        
+        # Publish status
+        try:
+            angle_msg = Float32()
+            angle_msg.data = steering_angle
+            self.steering_angle_pub.publish(angle_msg)
+            
+            lane_msg = Bool()
+            lane_msg.data = lane_detected
+            self.lane_detected_pub.publish(lane_msg)
+        except:
+            pass
+    
+    def create_early_turn_debug_image(self, original_image, roi, lines, mask, 
+                                    roi_top, roi_left, roi_right, roi_bottom,
+                                    steering_angle, lane_detected, turn_prediction):
+        """Enhanced debug image dengan early turn indicators"""
+        
+        debug_image = original_image.copy()
+        height, width = debug_image.shape[:2]
+        
+        # Draw EXPANDED ROI
+        cv2.rectangle(debug_image, (roi_left, roi_top), (roi_right, roi_bottom), (0, 255, 255), 2)
+        cv2.putText(debug_image, "EXPANDED ROI", (roi_left + 10, roi_top + 25), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # Draw detected lines dengan color coding
+        for i, line in enumerate(lines):
+            x1, y1, x2, y2 = line
+            x1_full = x1 + roi_left
+            y1_full = y1 + roi_top
+            x2_full = x2 + roi_left
+            y2_full = y2 + roi_top
+            
+            center_x = width // 2
+            line_center = (x1_full + x2_full) / 2
+            
+            if line_center < center_x:
+                color = (255, 0, 0)  # Blue for left
+            else:
+                color = (0, 0, 255)  # Red for right
+            
+            cv2.line(debug_image, (x1_full, y1_full), (x2_full, y2_full), color, 3)
+            cv2.circle(debug_image, (x1_full, y1_full), 4, (255, 255, 0), -1)
+            cv2.circle(debug_image, (x2_full, y2_full), 4, (0, 255, 255), -1)
+            
+            # Line number
+            mid_x = (x1_full + x2_full) // 2
+            mid_y = (y1_full + y2_full) // 2
+            cv2.putText(debug_image, str(i), (mid_x, mid_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        # Enhanced steering indicator dengan turn prediction
+        center_x = width // 2
+        arrow_length = 120
+        arrow_y = roi_bottom + 30
+        arrow_x = center_x + int(steering_angle * arrow_length)
+        
+        # Center line
+        cv2.line(debug_image, (center_x, arrow_y - 20), (center_x, arrow_y + 20), (255, 255, 255), 3)
+        cv2.putText(debug_image, "CENTER", (center_x - 30, arrow_y + 40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Arrow color berdasarkan turn prediction
+        if turn_prediction in ["RIGHT_TURN", "LEFT_TURN"]:
+            arrow_color = (255, 0, 255)  # Magenta untuk predicted turns
+        elif turn_prediction.startswith("CONTINUE_"):
+            arrow_color = (255, 100, 255)  # Light magenta untuk continue
+        elif lane_detected:
+            arrow_color = (0, 255, 0) if abs(steering_angle) < 0.3 else (0, 165, 255)
+        else:
+            arrow_color = (0, 0, 255)
+            
+        cv2.arrowedLine(debug_image, (center_x, arrow_y), (arrow_x, arrow_y), arrow_color, 4)
+        
+        # Enhanced status panel
+        self.draw_early_turn_status_panel(debug_image, steering_angle, lane_detected, len(lines), turn_prediction)
+        
+        # Mask overlay
+        if mask.size > 0:
+            mask_resized = cv2.resize(mask, (160, 120))
+            mask_colored = cv2.cvtColor(mask_resized, cv2.COLOR_GRAY2BGR)
+            debug_image[10:130, width-170:width-10] = mask_colored
+            cv2.rectangle(debug_image, (width-170, 10), (width-10, 130), (255, 255, 255), 2)
+            cv2.putText(debug_image, "WHITE MASK", (width-165, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        return debug_image
+    
+    def draw_early_turn_status_panel(self, image, steering_angle, lane_detected, num_lines, turn_prediction):
+        """Enhanced status panel dengan early turn info"""
+        
+        height, width = image.shape[:2]
+        
+        # Larger status background
+        cv2.rectangle(image, (10, 10), (500, 180), (0, 0, 0), -1)
+        cv2.rectangle(image, (10, 10), (500, 180), (255, 255, 255), 2)
+        
+        y_pos = 35
+        
+        # Detection status
+        status_text = "WHITE LINES DETECTED" if lane_detected else "NO WHITE LINES"
+        status_color = (0, 255, 0) if lane_detected else (0, 0, 255)
+        cv2.putText(image, status_text, (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        y_pos += 25
+        
+        # Turn prediction status
+        if turn_prediction != "NORMAL":
+            pred_color = (255, 0, 255) if "TURN" in turn_prediction else (255, 100, 0)
+            cv2.putText(image, f"PREDICTION: {turn_prediction}", (20, y_pos), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, pred_color, 2)
+            y_pos += 22
+        
+        # Steering info
+        direction = "STRAIGHT" if abs(steering_angle) < 0.1 else ("LEFT" if steering_angle < 0 else "RIGHT")
+        cv2.putText(image, f"Steering: {steering_angle:.3f} ({direction})", (20, y_pos), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        y_pos += 20
+        
+        # Missing line counters
+        cv2.putText(image, f"Missing - Left: {self.left_line_missing_count}, Right: {self.right_line_missing_count}", 
+                   (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y_pos += 18
+        
+        # Lines count dan prediction mode
+        pred_mode_text = "ON" if self.turn_prediction_mode else "OFF"
+        cv2.putText(image, f"Lines: {num_lines} | Prediction Mode: {pred_mode_text}", (20, y_pos), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        y_pos += 20
+        
+        # Frame and detection rate
+        cv2.putText(image, f"Frame: {self.frame_count}", (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        if self.frame_count > 0:
+            rate = (self.detection_count / self.frame_count) * 100
+            cv2.putText(image, f" | Rate: {rate:.1f}%", (150, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    
+    def publish_debug_image(self, debug_image):
+        """Publish debug image"""
+        try:
+            debug_msg = self.bridge.cv2_to_imgmsg(debug_image, "bgr8")
+            debug_msg.header.stamp = rospy.Time.now()
+            self.debug_image_pub.publish(debug_msg)
+            
+            _, compressed_data = cv2.imencode('.jpg', debug_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            compressed_msg = CompressedImage()
+            compressed_msg.header.stamp = rospy.Time.now()
+            compressed_msg.format = "jpeg"
+            compressed_msg.data = compressed_data.tostring()
+            self.debug_compressed_pub.publish(compressed_msg)
+            
+        except Exception as e:
+            rospy.logwarn(f"Failed to publish debug image: {e}")
+    
+    def run(self):
+        rospy.loginfo("Early Turn Detection Node started")
+        rospy.loginfo("ENHANCED for EARLY turn detection - prevents overshooting")
+        rospy.spin()
+
+if name == 'main':
+    try:
+        node = EarlyTurnDetectionNode()
+        node.run()
+    except rospy.ROSInterruptException:
+        pass
